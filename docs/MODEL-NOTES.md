@@ -85,7 +85,7 @@ checks and raw logs support — no vibes, no worker self-reports.
 
 ## glm-5.2 via opencode (`openrouter/z-ai/glm-5.2`)
 
-- The cheap-intelligence default (~$0.74/M in, $2.33/M out, 2026-07 —
+- The cheap-intelligence default (~$0.91/M in, $2.86/M out, 2026-07 —
   20-30x cheaper output than frontier coding models). Reliable on
   mechanical, tightly-specced work: file edits, format conversions,
   template-driven builds.

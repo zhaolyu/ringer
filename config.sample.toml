@@ -139,7 +139,7 @@ model_report_regex = "(?m)^model:[ \\t]*([^ \\t\\r\\n]+)[ \\t]*\\r?$"
 # OpenCode + OpenRouter — the universal model harness. One engine block runs
 # ANY OpenRouter-served model: the {model} placeholder is filled per task from
 # the manifest's "model" field, falling back to model_default below. Example
-# default: GLM-5.2 (z-ai/glm-5.2, roughly $0.74/M input, $2.33/M output as of
+# default: GLM-5.2 (z-ai/glm-5.2, roughly $0.91/M input, $2.86/M output as of
 # 2026-07) — the cheap-intelligence lane.
 # OpenCode has no OS sandbox, so `bin` points at engines/opencode-sandboxed.sh
 # (macOS Seatbelt: network + reads open, writes confined to the task dir, a
