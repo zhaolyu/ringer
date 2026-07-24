@@ -8265,6 +8265,33 @@ class RingerRunner:
                 append_text(runtime.log_path, f"[ringer.py] git worktree add failed:\n{message}\n")
                 return False, message.strip() or "git worktree add failed"
             return True, None
+        # Non-worktree mode reuses workdir/<key> across runs. Worktree mode
+        # deletes each task's worktree on pass, so its re-runs are always
+        # verified against a fresh checkout; plain mode kept the old taskdir,
+        # which let a leftover artifact from a previous run satisfy the check
+        # (and expect_files) and produce a false PASS with the worker doing
+        # nothing. Reset the taskdir first so verification only ever sees this
+        # run's output. A sibling taskdir nested inside this one (overlapping
+        # keys) is preserved so a concurrent task's work is never destroyed.
+        # Refuse rather than run if the reset fails — never verify stale state.
+        if taskdir.exists():
+            protected = {rt.taskdir for rt in self.runtimes if rt is not runtime}
+            try:
+                for entry in taskdir.iterdir():
+                    resolved = entry.resolve()
+                    if resolved in protected or any(
+                        resolved in candidate.parents for candidate in protected
+                    ):
+                        continue
+                    if entry.is_dir() and not entry.is_symlink():
+                        shutil.rmtree(entry)
+                    else:
+                        entry.unlink()
+            except OSError as exc:
+                return False, (
+                    f"could not reset existing taskdir {taskdir}: {exc} — "
+                    f"remove it manually and re-run"
+                )
         taskdir.mkdir(parents=True, exist_ok=True)
         return True, None
 
