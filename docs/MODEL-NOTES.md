@@ -148,6 +148,23 @@ checks and raw logs support — no vibes, no worker self-reports.
   read paths) plus an empirical XSS all-clear on the new DOM surfaces.
   Third proven-tier structured review today.
 
+- 2026-08-22 — exocortex graph-view redesign (run exocortex-graph-redesign,
+  4 sequential code-feature rounds on one 1,400-line canvas/HTML file, worktree
+  mode, `--variant high`, check = node --check + two external-tool anchors +
+  a palette gate + per-round assertions by name): rounds 1, 2 and 4 PASSED
+  attempt 1 (56k / 60k / 83k tokens, 2-6 min, ~1.5-2.5¢ each). Round 3 (the
+  largest: replace the default view, delete ~200 lines, add ~190) shows as
+  FAIL/2 attempts/234k tokens — the artifact was CORRECT; the fail was a
+  contradiction in MY check (a pr2 assertion demanding a string pr3 told the
+  worker to delete). The worker diagnosed that exactly, tried to fix the
+  checker, was blocked by the sandbox (correct), and wrote the contradiction
+  up in fix-summary instead of hacking around it. Two review findings across
+  four rounds, both scope-of-"first paragraph" reading errors on a large
+  header comment (dropped a measurement record once; a whitespace glitch
+  once) — spec the exact lines when asking for comment surgery. Lesson
+  reconfirmed: letter-labelled items (A-I) with exact anchors + a check that
+  names each item = first-try passes from the cheap lane on real UI code.
+
 ## kimi-k2.7 via opencode (`openrouter/moonshotai/kimi-k2.7-code`)
 
 - 2026-07-06 — adversarial pre-merge review (aicred spark): passed on
@@ -312,3 +329,12 @@ checks and raw logs support — no vibes, no worker self-reports.
 
 ## opencode / z-ai glm-5.2 (via openrouter)
 - 2026-07-09 (aicred-invoice-downloads, 4 code-fix tasks + 1 follow-up, worktrees+npm ci checks): systematic attempt-1 NO-OP — all 4 parallel workers produced zero edits and no summary on first attempt, then completed cleanly on attempt 2 after retry-prompt injection (34k-69k tokens each). Follow-up single task passed attempt 1. Suspect first-invocation session warm-up in opencode-sandboxed under parallel spawn; budget for 2 attempts on parallel GLM batches. Output quality on Next.js/Stripe route+test work: solid, spec-faithful, one boss-caught design gap (used user-scoped supabase client where RLS demanded service role — spec didn't say explicitly; say it explicitly).
+
+## claude engine (claude CLI on the subscription)
+
+- 2026-08-22 — probe (claude-engine-bare-probe): `--bare` in engine_args breaks
+  login ("Not logged in · Please run /login") — bare mode skips the OAuth/settings
+  lookup. Without `--bare`, a worker inside a repo checkout inherits that repo's
+  Claude Code hooks (exocortex has PostToolUse auto-commit), which is unsafe for
+  worktree workers. Until there is a hooks-off flag that keeps auth, route repo
+  edits through the sandboxed opencode lane instead.
