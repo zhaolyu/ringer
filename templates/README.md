@@ -21,6 +21,7 @@ A kit is a reusable Ringer starter: a manifest skeleton, check skeletons, and a 
 | `competitive-teardown` | Runs N scouts by competitor with verbatim-citation allowlist checks and a synthesis phase. | You need grounded competitor analysis with traceable source material. | Blueprint |
 | `data-pipeline` | Splits fetch, transform, and validate stages with executed validators and honesty rules. | You need a data workflow that proves each stage produced what it claims. | Blueprint |
 | `probe` | Provides a one-task manifest for smokes, probes, and post-mortems. | You need a visible, logged check before trusting a new engine, model, harness, or diagnosis. | Proven as a practice |
+| `holdout-probe` | Pairs a deliberately gameable visible check with a withheld `holdout_check` the worker never sees. | You need to know whether a model does the work or satisfies checks — its Goodhart gap — before trusting it with a gameable batch. | Blueprint |
 
 ## Kit Anatomy
 

@@ -1010,6 +1010,15 @@ class TaskSpec:
     # engine's {model} placeholder); empty means the engine's model_default.
     model: str = ""
     task_type: str = ""
+    # A second executed check the worker NEVER sees: not in the spec prompt,
+    # not in the retry prompt, not in any string handed to an engine. Runs
+    # only after the primary check PASSes. The gap between primary pass rate
+    # and holdout pass rate is the Goodhart gap in `./ringer.py models`.
+    holdout_check: str = ""
+    # If true, a holdout that does not pass turns the task's final verdict to
+    # FAIL — with no retry, since the retry lane exists to fix stated-check
+    # failures and injecting holdout output would leak the withheld check.
+    holdout_blocking: bool = False
 
     @classmethod
     def from_obj(cls, obj: dict[str, Any]) -> "TaskSpec":
@@ -1050,6 +1059,14 @@ class TaskSpec:
         task_type = obj.get("task_type", "")
         if not isinstance(task_type, str):
             raise ValueError(f"task {key}: task_type must be a string")
+        holdout_check = obj.get("holdout_check", "")
+        if not isinstance(holdout_check, str):
+            raise ValueError(f"task {key}: holdout_check must be a string (shell command)")
+        holdout_blocking = bool(obj.get("holdout_blocking", False))
+        if holdout_blocking and not holdout_check.strip():
+            raise ValueError(
+                f"task {key}: holdout_blocking without a holdout_check is a gate that can never run"
+            )
         return cls(
             key=key,
             spec=spec,
@@ -1062,6 +1079,8 @@ class TaskSpec:
             verified=verified.strip(),
             model=model.strip(),
             task_type=task_type.strip(),
+            holdout_check=holdout_check.strip(),
+            holdout_blocking=holdout_blocking,
         )
 
 
@@ -1207,6 +1226,27 @@ def lint_manifest(
                 f"{task.key}: no task_type; the model log buckets this as (untyped) — "
                 "name one (e.g. code-feature, research, image-gen) so './ringer.py models' can guide routing."
             )
+        if task.holdout_check:
+            holdout_norm = normalized_command_text(task.holdout_check)
+            if holdout_norm and holdout_norm in normalized_command_text(task.spec):
+                findings.append(
+                    f"{task.key}: holdout leak — the holdout command appears inside the spec; "
+                    "a withheld check the worker can read is a visible check wearing a blindfold."
+                )
+            if holdout_norm == normalized_command_text(task.check):
+                findings.append(
+                    f"{task.key}: holdout is identical to the primary check; it can only "
+                    "re-prove what the visible check already proved."
+                )
+            if check_cannot_fail(task.holdout_check):
+                findings.append(
+                    f"{task.key}: holdout: check cannot fail, so it measures nothing."
+                )
+            if check_may_fail_silently(task.holdout_check):
+                findings.append(
+                    f"{task.key}: holdout: check may fail without printing why; the eval "
+                    "log depends on failure output (there is no retry to starve)."
+                )
 
     if len(manifest.tasks) >= 3 and manifest.max_parallel == 1:
         findings.append("manifest: tasks will run serially; set max_parallel.")
@@ -1258,6 +1298,11 @@ def spec_is_file_pointer(spec: str) -> bool:
     if len(text) >= 600:
         return False
     return bool(FILE_POINTER_SPEC_RE.search(text))
+
+
+def normalized_command_text(text: str) -> str:
+    """Whitespace-collapsed command text, for leak/identity comparisons only."""
+    return " ".join(text.split())
 
 
 def check_cannot_fail(check: str) -> bool:
@@ -1448,6 +1493,8 @@ class TaskRuntime:
     setup_error: str | None = None
     last_worker_command: list[str] = field(default_factory=list)
     steering: dict[str, Any] | None = None
+    holdout_outcome: str | None = None
+    holdout_output: str = ""
 
     def elapsed_s(self, now: float) -> float:
         if self.started_at_monotonic is None:
@@ -1472,6 +1519,16 @@ class VerifyResult:
     check_timed_out: bool
     raw_output_excerpt: str
     missing_files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class HoldoutResult:
+    # Three outcomes, never two: "pass" (exit 0), "fail" (nonzero exit), and
+    # "error" (timed out, unrunnable, unjudgeable). "error" is never folded
+    # into "pass" — an unrunnable check is not evidence either way.
+    outcome: str
+    check_returncode: int | None
+    raw_output_excerpt: str
 
 
 class ProcessTree:
@@ -1639,6 +1696,13 @@ class StateWriter:
                     "check_returncode": runtime.last_check_returncode,
                     "check_timed_out": runtime.last_check_timed_out,
                     "check_output_tail": shorten(runtime.last_check_output, 4000),
+                    # The holdout COMMAND is deliberately never serialized here:
+                    # run state is world-readable and a concurrent full-access
+                    # worker could read a sibling task's withheld check from it.
+                    # Outcome and output appear only after the holdout has run.
+                    "has_holdout": bool(runtime.task.holdout_check),
+                    "holdout": runtime.holdout_outcome,
+                    "holdout_output_tail": shorten(runtime.holdout_output, 4000),
                     "setup_error": runtime.setup_error,
                     "timeout_s": runtime.task.timeout_s,
                     "taskdir": str(runtime.taskdir),
@@ -3959,6 +4023,30 @@ def render_work_group(
                 f'<details class="proof"><summary>{proof_label}</summary>'
                 f"<pre>{html_escape(shorten(proof_tail, 1200))}</pre></details>"
             )
+        # The withheld holdout's verdict, beside the verification line. PASS
+        # with a failed holdout is the cell this feature exists for: the
+        # stated check was satisfied without the job being done.
+        holdout_outcome = str(task.get("holdout") or "").strip()
+        if holdout_outcome:
+            holdout_labels = {
+                "pass": ("verified", "Holdout check (withheld from the worker): passed"),
+                "fail": (
+                    "verified holdout-fail",
+                    "HOLDOUT FAILED — the stated check was satisfied, the withheld check was not",
+                ),
+                "error": (
+                    "verified holdout-fail",
+                    "Holdout could not run — no verdict either way, never counted as a pass",
+                ),
+            }
+            css, label = holdout_labels.get(holdout_outcome, ("verified", holdout_outcome))
+            verified_html += f'<span class="{css}">{html_escape(label)}</span>'
+            holdout_tail = str(task.get("holdout_output_tail") or "").strip()
+            if holdout_tail:
+                verified_html += (
+                    '<details class="proof"><summary>See the holdout output</summary>'
+                    f"<pre>{html_escape(shorten(holdout_tail, 1200))}</pre></details>"
+                )
 
     links_html = render_task_links(
         task,
@@ -5106,7 +5194,8 @@ class EvalLogger:
             db_row = {
                 key: value
                 for key, value in row.items()
-                if key not in {"model", "reasoning_effort", "task_type", "retry"}
+                if key
+                not in {"model", "reasoning_effort", "task_type", "retry", "holdout", "holdout_declared"}
             }
             try:
                 self._conn.execute(
@@ -5413,6 +5502,11 @@ def aggregate_model_log_rows(
                 "_first_try_passed": 0,
                 "_duration_ms": [],
                 "_tokens": [],
+                "_holdout_declared": 0,
+                "_holdout_ran": 0,
+                "_holdout_passed": 0,
+                "_holdout_failed": 0,
+                "_holdout_errors": 0,
             },
         )
         group["tasks"] += 1
@@ -5421,6 +5515,17 @@ def aggregate_model_log_rows(
             group["passed"] += 1
         else:
             group["failed"] += 1
+        if bool(final.get("holdout_declared")):
+            group["_holdout_declared"] += 1
+            holdout_outcome = model_log_text(final.get("holdout")).lower()
+            if holdout_outcome in {"pass", "fail", "error"}:
+                group["_holdout_ran"] += 1
+            if holdout_outcome == "pass":
+                group["_holdout_passed"] += 1
+            elif holdout_outcome == "fail":
+                group["_holdout_failed"] += 1
+            elif holdout_outcome == "error":
+                group["_holdout_errors"] += 1
         if model_log_text(first.get("verdict")).upper() == "PASS":
             group["_first_try_passed"] += 1
         duration_ms = model_log_int(final.get("duration_ms"))
@@ -5443,6 +5548,20 @@ def aggregate_model_log_rows(
         )
         group["median_duration_ms"] = median_int(group["_duration_ms"])
         group["median_tokens"] = median_int(group["_tokens"])
+        # Goodhart gap, over the holdout-declaring slice only. Denominators:
+        # holdout_pass_rate uses judged holdouts (pass+fail; errors reported,
+        # never counted as evidence either way); the slice's primary pass rate
+        # uses the fact that a holdout RUNS exactly when the primary check
+        # passed. None means "no data", which is not the same as 0.0.
+        declared = group["_holdout_declared"]
+        judged = group["_holdout_passed"] + group["_holdout_failed"]
+        holdout_pass_rate = group["_holdout_passed"] / judged if judged else None
+        slice_primary_pass_rate = group["_holdout_ran"] / declared if declared else None
+        goodhart_gap = (
+            slice_primary_pass_rate - holdout_pass_rate
+            if holdout_pass_rate is not None and slice_primary_pass_rate is not None
+            else None
+        )
         finalized.append(
             {
                 "engine": group["engine"],
@@ -5460,6 +5579,12 @@ def aggregate_model_log_rows(
                 "median_duration_ms": group["median_duration_ms"],
                 "median_tokens": group["median_tokens"],
                 "last_seen": group["last_seen"],
+                "holdout_tasks": declared,
+                "holdout_passed": group["_holdout_passed"],
+                "holdout_failed": group["_holdout_failed"],
+                "holdout_errors": group["_holdout_errors"],
+                "holdout_pass_rate": holdout_pass_rate,
+                "goodhart_gap": goodhart_gap,
             }
         )
     return sorted(
@@ -7754,6 +7879,19 @@ def print_model_log_table(path: Path, rows_read: int, skipped: int, groups: list
             shorten(str(group.get("latest_note") or ""), 60),
         )
         print(" | ".join(f"{shorten(value, width):<{width}}" for value, width in zip(values, widths)))
+        if int(group.get("holdout_tasks") or 0) > 0:
+            gap = group.get("goodhart_gap")
+            gap_text = "n/a" if gap is None else f"{gap:+.0%}"
+            rate = group.get("holdout_pass_rate")
+            rate_text = "n/a" if rate is None else f"{rate:.0%}"
+            errors = int(group.get("holdout_errors") or 0)
+            error_text = f", {errors} error(s) excluded" if errors else ""
+            print(
+                f"    holdout: {fmt_int(group.get('holdout_passed'))}/"
+                f"{int(group.get('holdout_passed') or 0) + int(group.get('holdout_failed') or 0)} "
+                f"judged pass ({rate_text}) over {fmt_int(group.get('holdout_tasks'))} declaring task(s)"
+                f"{error_text} — goodhart_gap {gap_text}"
+            )
     print("Judgment layer: docs/MODEL-NOTES.md")
     unregistered_slugs = sorted(
         {str(group.get("model") or "") for group in groups if group.get("unregistered") and group.get("model")}
@@ -7975,6 +8113,41 @@ class Verifier:
             missing_files=missing_files,
         )
 
+    async def run_holdout(self, task: TaskSpec, taskdir: Path) -> HoldoutResult:
+        # Same execution plumbing as the primary check (same shell, same cwd),
+        # but no expect_files semantics and no retry lane: the holdout grades
+        # work the worker believes is finished.
+        try:
+            check_returncode, check_timed_out, output = await self._run_check(
+                task.holdout_check, taskdir
+            )
+        except Exception as exc:
+            return HoldoutResult(
+                outcome="error",
+                check_returncode=None,
+                raw_output_excerpt=f"[ringer] holdout could not run: {exc}",
+            )
+        if check_timed_out:
+            outcome = "error"
+            note = "[ringer] holdout timed out — could-not-judge, not a pass or fail."
+            output = f"{note}\n{output}" if output.strip() else note
+        elif check_returncode is None:
+            outcome = "error"
+        elif check_returncode == 0:
+            outcome = "pass"
+        else:
+            outcome = "fail"
+            if not output.strip():
+                output = (
+                    f"[ringer] holdout failed silently (exit {check_returncode}, no output). "
+                    "Prefer holdouts that print WHY they fail — the eval log depends on it."
+                )
+        return HoldoutResult(
+            outcome=outcome,
+            check_returncode=check_returncode,
+            raw_output_excerpt=output[:2000],
+        )
+
     @staticmethod
     def _is_nonempty_file(path: Path) -> bool:
         try:
@@ -8132,12 +8305,35 @@ class RingerRunner:
                         runtime.tokens = (runtime.tokens or 0) + worker.tokens
                 verify = await self.verifier.verify(runtime.task, runtime.taskdir)
                 verdict = verdict_for(worker, verify)
+                # The holdout runs only after a primary PASS, against the same
+                # taskdir, before any worktree cleanup. Its command and output
+                # never reach a worker prompt: the retry lane below is built
+                # from the task spec and the PRIMARY check's failure context
+                # exclusively, and a holdout-blocked task never retries at all.
+                holdout: HoldoutResult | None = None
+                holdout_blocked = False
+                if verdict == "PASS" and runtime.task.holdout_check:
+                    holdout = await self.verifier.run_holdout(runtime.task, runtime.taskdir)
+                    with self.lock:
+                        runtime.holdout_outcome = holdout.outcome
+                        runtime.holdout_output = holdout.raw_output_excerpt
+                    append_text(
+                        runtime.log_path,
+                        f"[ringer.py] holdout: {holdout.outcome} "
+                        f"(rc={holdout.check_returncode})\n",
+                    )
+                    if runtime.task.holdout_blocking and holdout.outcome != "pass":
+                        verdict = "FAIL"
+                        holdout_blocked = True
                 with self.lock:
                     runtime.last_check_returncode = verify.check_returncode
                     runtime.last_check_timed_out = verify.check_timed_out
                     runtime.last_check_output = verify.raw_output_excerpt
                 duration_ms = int((time.monotonic() - attempt_started) * 1000)
-                self._log_attempt(runtime, current_spec, retrying, worker, verify, verdict, duration_ms)
+                self._log_attempt(
+                    runtime, current_spec, retrying, worker, verify, verdict, duration_ms,
+                    holdout=holdout,
+                )
                 if verdict == "PASS":
                     self._harvest_deliverables_on_pass(runtime)
                     with self.lock:
@@ -8146,7 +8342,7 @@ class RingerRunner:
                         runtime.ended_at_monotonic = time.monotonic()
                     await self._cleanup_worktree_on_pass(runtime)
                     return
-                if attempt < max_attempts and verdict in {"FAIL", "TIMEOUT"}:
+                if not holdout_blocked and attempt < max_attempts and verdict in {"FAIL", "TIMEOUT"}:
                     failure_context = build_failure_context(runtime.log_path, verify.raw_output_excerpt)
                     current_spec = (
                         f"{runtime.task.spec}\n\n"
@@ -8528,6 +8724,7 @@ class RingerRunner:
         verify: VerifyResult,
         verdict: str,
         duration_ms: int,
+        holdout: HoldoutResult | None = None,
     ) -> None:
         engine = self.config.engines.get(runtime.task.engine)
         resolved_model = resolved_task_model(
@@ -8561,6 +8758,10 @@ class RingerRunner:
             notes_parts.append(f"missing_expect_files={json.dumps(list(verify.missing_files))}")
         notes_parts.append("raw_check_output_first_2000_chars:")
         notes_parts.append(verify.raw_output_excerpt)
+        if holdout is not None:
+            notes_parts.append(f"holdout={holdout.outcome} (rc={holdout.check_returncode})")
+            notes_parts.append("raw_holdout_output_first_2000_chars:")
+            notes_parts.append(holdout.raw_output_excerpt)
         with contextlib.suppress(Exception):
             self._write_steering_observation(
                 runtime,
@@ -8591,6 +8792,11 @@ class RingerRunner:
                 "reasoning_effort": reasoning_effort,
                 "task_type": runtime.task.task_type,
                 "retry": retrying,
+                # holdout is absent when no holdout ran this attempt; a task
+                # that declares one is marked holdout_declared on every row so
+                # the Goodhart gap has an honest denominator.
+                "holdout_declared": bool(runtime.task.holdout_check),
+                **({"holdout": holdout.outcome} if holdout is not None else {}),
             }
         )
 
@@ -9239,6 +9445,8 @@ async def run_baseline(manifest: Manifest, *, config: AppConfig) -> int:
     print(f"Baseline: executing {total} check(s) with no workers spawned.")
     failures = 0
     errors = 0
+    holdout_failures = 0
+    holdout_errors = 0
     leaked_worktrees: list[str] = []
     try:
         for task in manifest.tasks:
@@ -9286,6 +9494,24 @@ async def run_baseline(manifest: Manifest, *, config: AppConfig) -> int:
                     excerpt = verify.raw_output_excerpt.strip()
                     for line in excerpt.splitlines()[:6]:
                         print(f"    {line}")
+                if task.holdout_check:
+                    # Holdouts get the same prove-your-checks preflight as
+                    # primary checks, with the same expected-fail reading.
+                    holdout = await verifier.run_holdout(task, taskdir)
+                    holdout_status = {"pass": "pass", "fail": "FAIL", "error": "ERROR"}[
+                        holdout.outcome
+                    ]
+                    print(
+                        f"{task.key:<24} baseline-holdout: {holdout_status} "
+                        f"(rc={holdout.check_returncode})"
+                    )
+                    if holdout.outcome != "pass":
+                        if holdout.outcome == "fail":
+                            holdout_failures += 1
+                        else:
+                            holdout_errors += 1
+                        for line in holdout.raw_output_excerpt.strip().splitlines()[:6]:
+                            print(f"    {line}")
             finally:
                 if worktrees:
                     proc = await asyncio.create_subprocess_exec(
@@ -9312,6 +9538,11 @@ async def run_baseline(manifest: Manifest, *, config: AppConfig) -> int:
         shutil.rmtree(baseline_root, ignore_errors=True)
     passed = total - failures - errors
     print(f"\nbaseline: {passed} pass, {failures} fail, {errors} error of {total} check(s).")
+    if holdout_failures or holdout_errors:
+        print(
+            f"baseline holdouts: {holdout_failures} fail, {holdout_errors} error "
+            "(same expected-fail reading as primary checks)."
+        )
     if leaked_worktrees:
         print(
             f"WARNING: {len(leaked_worktrees)} baseline worktree(s) could not be removed; "
@@ -9433,15 +9664,21 @@ def print_lint_findings(findings: list[str]) -> None:
 def print_summary(run_id: str, runtimes: list[TaskRuntime]) -> None:
     print("\nSummary")
     print(f"run_id: {run_id}")
-    header = f"{'task':<24} {'status':<8} {'verdict':<8} {'attempts':>8} {'tokens':>10} {'elapsed_s':>10}"
+    any_holdout = any(runtime.task.holdout_check for runtime in runtimes)
+    holdout_header = f" {'holdout':<8}" if any_holdout else ""
+    header = (
+        f"{'task':<24} {'status':<8} {'verdict':<8}{holdout_header} "
+        f"{'attempts':>8} {'tokens':>10} {'elapsed_s':>10}"
+    )
     print(header)
     print("-" * len(header))
     now = time.monotonic()
     for runtime in runtimes:
         tokens = "" if runtime.tokens is None else str(runtime.tokens)
+        holdout_cell = f" {(runtime.holdout_outcome or ''):<8}" if any_holdout else ""
         print(
             f"{runtime.task.key:<24} {runtime.status:<8} "
-            f"{(runtime.final_verdict or ''):<8} {runtime.attempts:>8} "
+            f"{(runtime.final_verdict or ''):<8}{holdout_cell} {runtime.attempts:>8} "
             f"{tokens:>10} {runtime.elapsed_s(now):>10.1f}"
         )
     setup_failures = [r for r in runtimes if r.setup_error]
