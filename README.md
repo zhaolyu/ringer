@@ -104,6 +104,8 @@ Each task gets its own directory, its own worker, its own log, and its own verdi
 | `timeout_s` | Per-task kill timer (default 900) |
 | `engine_args` | Extra CLI flags for this task's worker, spliced in at the engine's `{engine_args}` placeholder — e.g. `["-c", "model_reasoning_effort=low"]` so the orchestrator picks reasoning depth per task |
 | `verified` | One plain-English sentence saying what the check proves — shown on the results page next to "finished & checked" |
+| `holdout_check` | A second executed check **the worker never sees** — not in the spec, never in a retry prompt, never serialized where a concurrent worker could read it. Runs only after the primary check PASSes (in worktrees mode, before the worktree is removed). Logged three-outcome per attempt (`pass`/`fail`/`error` — an unrunnable holdout is `error`, never a pass), and non-blocking by default: `PASS` with a failed holdout stays `PASS`, visibly. The per-model gap between primary and holdout pass rates is the **Goodhart gap** in `./ringer.py models` — it separates "does the work" from "satisfies visible checks". Skeleton: [`templates/holdout-probe/`](templates/holdout-probe/) |
+| `holdout_blocking` | If true, a holdout that does not pass turns the task's final verdict to FAIL, with **no retry** — the retry lane exists to fix stated-check failures, and injecting holdout output would leak the withheld check. Requires `holdout_check` |
 | `full_access` | Worker runs unsandboxed — required for workers that spawn their own sub-workers; must also be enabled in config |
 | `worktrees` (run-level) | Give each task an isolated git worktree of `repo` so parallel workers can't collide |
 
@@ -113,7 +115,7 @@ Not sure what your tasks even are yet? [`docs/interview-prompt.md`](docs/intervi
 
 ## Lint
 
-Lint checks a manifest for the mistakes that make swarms hard to trust: checks that cannot fail, silent checks, worktree deliverables that disappear, worker commits that die with deleted worktrees, serial fan-out, write collisions, and underspecified specs.
+Lint checks a manifest for the mistakes that make swarms hard to trust: checks that cannot fail, silent checks, worktree deliverables that disappear, worker commits that die with deleted worktrees, serial fan-out, write collisions, and underspecified specs. Holdouts get the same treatment plus two of their own: a **holdout leak** (the holdout command quoted inside the spec — a withheld check the worker can read is a visible check wearing a blindfold) and a **holdout identical to the primary check** (it can only re-prove what was already proved).
 
 ```bash
 ./ringer.py lint templates/review-swarm/manifest.json
@@ -132,7 +134,7 @@ Lint reads the manifest; `--baseline` executes it — every task's `check` runs 
 ./ringer.py run swarm.json --baseline
 ```
 
-Each check runs in a fresh scratch dir (a detached worktree when the manifest uses worktrees) through the same verifier as a real run. Reading the results: an assertion that demands the NEW behavior workers will build is *expected* to FAIL baseline; an assertion about UNCHANGED behavior that fails baseline is a bug in the check itself, and at run time it would burn a worker's attempts against something no model can satisfy. Fix the check before spawning.
+Each check runs in a fresh scratch dir (a detached worktree when the manifest uses worktrees) through the same verifier as a real run. `holdout_check` commands are executed too, labeled `baseline-holdout`, with the same reading. Reading the results: an assertion that demands the NEW behavior workers will build is *expected* to FAIL baseline; an assertion about UNCHANGED behavior that fails baseline is a bug in the check itself, and at run time it would burn a worker's attempts against something no model can satisfy. Fix the check before spawning.
 
 ## Make your agent actually use this
 
@@ -277,7 +279,9 @@ Read it with:
 ./ringer.py models          # per-(model, task_type) scoreboard across the local log
 ```
 
-The scoreboard reports, per model and task_type: tasks, attempts, `pass_rate`, `first_try_pass_rate`, median duration and token count, and `last_seen`. The signal for routing is `first_try_pass_rate` — the share of tasks that passed on attempt 1 without a retry; `pass_rate` is the rescued rate after Ringer's single retry, so the gap between the two is the cost of the retry lane. Slice the log with `--log` (a different JSONL), `--task-type`, `--model`, `--engine`, `--since`, or `--json` for piping elsewhere.
+The scoreboard reports, per model and task_type: tasks, attempts, `pass_rate`, `first_try_pass_rate`, median duration and token count, and `last_seen`. The signal for routing is `first_try_pass_rate` — the share of tasks that passed on attempt 1 without a retry; `pass_rate` is the rescued rate after Ringer's single retry, so the gap between the two is the cost of the retry lane.
+
+Tasks that declare a `holdout_check` add a second signal: the **Goodhart gap**, printed under the row and carried in `--json` (`holdout_pass_rate`, `goodhart_gap`). It is the primary-check pass rate minus the holdout pass rate, computed over the holdout-declaring slice only, with `error` holdouts reported but excluded from the denominator (an unrunnable check is not evidence either way). A model with a high pass rate and a large gap is good at satisfying visible checks, not at the work — the strongest negative routing signal the log can produce. The gap is displayed, not yet used in `--explore` promotion: measure before legislating. Slice the log with `--log` (a different JSONL), `--task-type`, `--model`, `--engine`, `--since`, or `--json` for piping elsewhere.
 
 History from before the `model` / `task_type` / `retry` columns existed can be seeded in one pass:
 

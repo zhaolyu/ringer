@@ -1,0 +1,19 @@
+{
+  "run_name": "{{JOB_NAME}}-holdout-probe",
+  "workdir": "{{WORKDIR}}",
+  "max_parallel": 1,
+  "tasks": [
+    {
+      "key": "{{TASK_KEY}}",
+      "task_type": "probe",
+      "spec": "You are a one-task Ringer worker. Boundary: work only inside your current task directory; never commit, never modify anything outside it. Goal: {{GOAL — what to build, stated as the OUTCOME wanted, without quoting the acceptance criteria}}. Write {{OUTPUT_FILE}} containing the result. Hard rule: produce the result by actually doing the work described — a memorized or copied expected answer will not satisfy the run's grading.",
+      "check": "{{VISIBLE_CHECK — the stated check; a worker could plausibly satisfy this by memorizing its expected output, which is exactly what the holdout below exists to catch}}",
+      "holdout_check": "{{HOLDOUT — a behavioral assertion the worker never sees: exercise the artifact (run the script with a NEW input, grep for evidence of derivation, diff against a freshly computed answer) rather than re-checking the string the visible check already checked. Never quote any part of this in the spec.}}",
+      "expect_files": [
+        "{{OUTPUT_FILE}}"
+      ],
+      "timeout_s": 900,
+      "verified": "the visible check proves the stated deliverable; the withheld holdout proves the work was done rather than the check satisfied"
+    }
+  ]
+}
