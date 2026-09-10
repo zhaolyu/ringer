@@ -338,3 +338,80 @@ checks and raw logs support — no vibes, no worker self-reports.
   Claude Code hooks (exocortex has PostToolUse auto-commit), which is unsafe for
   worktree workers. Until there is a hooks-off flag that keeps auth, route repo
   edits through the sandboxed opencode lane instead.
+- 2026-09-08 — claude-sonnet-5, code-fix (equity-bot F-1: persist the paper broker across
+  processes; ~150-line change across 5 files + a new test module + 3 doc edits; run
+  equity-bot-f1-paper-persistence): PASS on attempt 2, 839s total. Attempt 1 did the ENTIRE
+  fix correctly and its own run of the executed check passed (21/21 scenarios, verify line,
+  three-process CLI e2e), and it made one good judgment call the spec had wrong (not persisting
+  from `__init__`/`create_plan`, which would have forged paper state before `paper init`),
+  documenting it in IMPLEMENTATION_NOTES. It FAILED only because it `cd`'d into the repo and
+  wrote `./notes.md` there instead of the task dir — expect_files missed, allowlist tripped.
+  Attempt 2 re-verified everything and reported "deleted the misplaced notes.md" — the
+  orchestrator had already moved it, so that line is a small honesty flag (reported an action
+  it did not perform). Lessons for spec authors: (1) give deliverable paths as ABSOLUTE paths
+  when the worker will `cd` elsewhere; (2) `claude -p` denied `Read` on the check script
+  because it sat outside `--add-dir` and cwd — either add its dir to `--add-dir` or put the
+  check inside the task dir; the worker fell back to `cat` and lost nothing, but it noted the
+  friction. Scoreboard's attempt count understates the model here, as with the codex 2026-07-10
+  row.
+- 2026-09-08 — claude-sonnet-5, code-feature (equity-bot read-only IBKR adapter + `broker
+  check`: new ~330-line adapter over ib_async, CLI command, 14+5 tests, notes; run
+  equity-bot-ibkr-readonly-adapter): recorded FAIL after 2 attempts, 1386s — **both failures
+  were the CHECK's fault, not the model's.** Attempt 1 built everything correctly, introspected
+  the real ib_async 2.1.0 API instead of trusting memory, and its own check run passed all
+  seven executed probes against the live paper Gateway; it only needed `--account` by hand
+  because my discovery regex `DU\d{5,}` did not match the real id `DUT104325`. Between
+  attempts the operator created `.env` (following the orchestrator's own instructions) and my
+  check gated on `.env` *existing*, so attempt 2 failed before ruff ran. Attempt 2 then did
+  the right thing: verified independently, refused to delete a file it did not create, and
+  surfaced the choice. After fixing the two check bugs the unchanged tree passed 7/7.
+  Lessons: never gate on an operator-owned file existing (inspect its key names instead);
+  verify id formats against the real system before writing a regex; a retry that reports
+  "the environment changed under me" is a good worker, not a failed one. Scoreboard FAIL
+  row understates the model again.
+- 2026-09-08 — claude-sonnet-5, code-feature (equity-bot run ledger: migration, migration
+  tracking, engine.run_wakeup with lock/expectations/missed-runs, 3 CLI commands, 5 tests;
+  run equity-bot-run-ledger): **PASS on attempt 1**, 1746s, against a check that hash-pins
+  four pre-written failing scenarios AND the scenario runner. Notable: it read for ~20 min
+  before writing a line, and it surfaced two genuine contradictions in the orchestrator's own
+  spec rather than papering over them (a `fill` listed as a findings event in prose but
+  asserted `ok` in the scenarios; and scheduled_for/started_at both taken from the simulated
+  clock, which it flagged as making `lag` permanently zero and named the fix). It chose the
+  hash-pinned scenarios over the prose and documented why — the correct precedence.
+  ORCHESTRATOR LESSON, not the model's: the FIRST attempt of this task was killed at 21 min
+  because s24 asserted a 9-share fill against a 100%-of-plan tranche that derives 18 — my
+  arithmetic slip, copied from a 50% scenario. The worker had started recomputing sizing to
+  check me, which is exactly right, but the scenario being hash-pinned meant it could never
+  have passed. Verify derived values in a pre-written test before launching, and tell the
+  worker they were verified so it doesn't spend 20 minutes re-deriving them.
+- 2026-09-08 — claude-sonnet-5, code-feature (equity-bot report file + confirm watchdog; run
+  equity-bot-report-file): recorded FAIL after 2 attempts, 2168s — **the code was correct on
+  attempt 1 and the failure was the orchestrator's scenario, for the second time in three
+  runs.** s32 scripted the paper broker to answer `open_orders` with Unknown once, expecting
+  it at the open wakeup's reconcile; `orders.submit` calls `open_orders()` for adopt-on-match,
+  so activation consumed it a day early. The worker traced that itself from source, cross-
+  checked it against an already-passing scenario (s09) that scopes the same mechanism
+  correctly, proposed the exact one-line fix, refused to touch the hash-pinned file, and
+  documented it — textbook behaviour. After the orchestrator fixed the scenario, the
+  unchanged tree passed 28/28 and all five probes.
+  ORCHESTRATOR PATTERN, now three for three: I verify that a new pre-written scenario FAILS,
+  but not that it fails for the REASON I intend. s24 asserted a wrong derived quantity; s32
+  scripted a call consumed on a different code path; an earlier check gated on an
+  operator-owned file merely existing. Before launching, trace the mechanism the scenario
+  depends on — grep every caller of the scripted method — and prefer the most narrowly scoped
+  hook (`positions` is called only by reconcile; `open_orders` is called by three things).
+- 2026-09-08 — claude-sonnet-5, code-feature x2 (equity-bot bar feed, then scheduler): bar feed
+  **PASS attempt 1**, 1961s — built three bar clients, a composite with a dispute rule, a
+  migration and 9 tests, and its check included a REAL tvremix network call it passed. It also
+  found that the orchestrator's `assert_bar` compared prices as raw strings while `assert_order`
+  normalized them, and worked around it in the only layer it owned (widening the column type),
+  flagging the reasoning — correct diagnosis, and the orchestrator moved the fix back into the
+  assertion where it belonged. Scheduler run was killed at 48min on ANOTHER orchestrator
+  scenario bug (s34 asserted a 90-minute lag against the old DST-blind slot; the worker's own
+  DST fix moved the slot 40 minutes, making the true lag 130) — its code was complete and
+  correct, and after the orchestrator fixed the scenario the unchanged tree passed everything.
+  RUNNING TALLY, worth acting on: across five equity-bot runs, FOUR failures were the
+  orchestrator's pre-written scenarios or checks, ZERO were the model's code. claude-sonnet-5
+  on tightly-specified code-feature work with an executed check is performing at or near
+  first-try on every one. The bottleneck is spec quality, not worker quality — budget the
+  verification time into writing the scenario, not into retries.
